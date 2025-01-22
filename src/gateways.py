@@ -1,150 +1,116 @@
-from typing import Dict, Any, Optional, List
+import logging
+import requests
 
-import boto3
-from botocore.exceptions import ClientError
+from typing import Dict, Any, List
+from urllib.parse import urljoin
 
 from src.config import settings
 
+logger = logging.getLogger(__name__)
 
-class BaseAWSClient:
 
-    def __init__(self, config: Dict[str, Any] = None):
-        """Initialize AWS client with credentials from settings.
-        Args:
-            config: Kept for backwards compatibility, not used. All config comes from settings.
+class JiraClient:
+    def __init__(self):
         """
-        self._config = config
-        self.credentials = self._authenticate()
-        self.session = self._create_session()
-        self.sts_client = self.create_client('sts')
+        Initialize JiraClient with basic authentication.
 
-    def _authenticate(self) -> Dict[str, Any]:
-        base_creds = {
-            'access_key_id': settings.AWS_ACCESS_KEY_ID,
-            'secret_access_key': settings.AWS_SECRET_ACCESS_KEY,
-            'region': settings.AWS_REGION if hasattr(settings, 'AWS_REGION') else 'us-east-1'
+        config should contain:
+        - domain: Your Jira domain (e.g., 'your-domain.atlassian.net')
+        - email: Your Atlassian account email
+        - api_token: API token generated from Atlassian account settings
+        """
+        self._domain = settings.ATLASSIAN_DOMAIN
+        self._base_url = f"https://{self._domain}"
+        self._auth = (settings.ATLASSIAN_EMAIL, settings.ATLASSIAN_API_TOKEN)
+        self._api_version = "3"
+
+    def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+        """Make a request to the Jira API."""
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
 
-        if hasattr(settings, 'AWS_USE_STS') and settings.AWS_USE_STS:
-            session_creds = self._get_session_token(
-                duration_seconds=getattr(settings, 'AWS_SESSION_DURATION', 3600),
-                serial_number=getattr(settings, 'AWS_MFA_SERIAL', None),
-                token_code=getattr(settings, 'AWS_MFA_TOKEN', None)
-            )
-            base_creds.update(session_creds)
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
 
-        return base_creds
-
-    def _get_session_token(self, duration_seconds: int = 3600,
-                           serial_number: Optional[str] = None,
-                           token_code: Optional[str] = None) -> Dict[str, Any]:
-        """Get temporary session credentials using AWS STS.
-
-        Args:
-            duration_seconds: How long the credentials should remain valid
-            serial_number: ARN of MFA device if MFA is required
-            token_code: Current MFA code if MFA is required
-
-        Returns:
-            Dictionary containing temporary credentials
-        """
         try:
-            sts = boto3.client(
-                'sts',
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_REGION if hasattr(settings, 'AWS_REGION') else 'us-east-1'
+            url = urljoin(self._base_url, endpoint)
+            response = requests.request(
+                method,
+                url,
+                auth=self._auth,
+                headers=headers,
+                **kwargs
             )
 
-            params = {
-                'DurationSeconds': duration_seconds
-            }
+            if response.status_code >= 400:
+                raise Exception(f"API request failed with status {response.status_code}: {response.text}")
 
-            if serial_number and token_code:
-                params.update({
-                    'SerialNumber': serial_number,
-                    'TokenCode': token_code
-                })
+            return response.json()
 
-            response = sts.get_session_token(**params)
+        except Exception as e:
+            raise Exception(f"Jira API error: {str(e)}") from e
 
-            credentials = response['Credentials']
-            return {
-                'access_key_id': credentials['AccessKeyId'],
-                'secret_access_key': credentials['SecretAccessKey'],
-                'session_token': credentials['SessionToken'],
-                'expiration': credentials['Expiration']
-            }
+    def list_issues(self) -> List[Dict[str, Any]]:
+        """List Jira issues with pagination."""
+        try:
+            issues = []
+            start_at = 0
+            batch_size = 100
 
-        except ClientError as e:
-            print(f"Failed to get session token: {str(e)}")
-            raise
+            while True:
+                endpoint = f"/rest/api/{self._api_version}/search"
+                query = {
+                    "jql": "order by created DESC",
+                    "startAt": start_at,
+                    "maxResults": batch_size,
+                    "fields": ["key", "project"]
+                }
 
-    def _create_session(self) -> boto3.Session:
-        return boto3.Session(
-            aws_access_key_id=self.credentials['access_key_id'],
-            aws_secret_access_key=self.credentials['secret_access_key'],
-            aws_session_token=self.credentials['session_token'],
-            region_name=self.credentials['region']
-        )
+                response = self._request("POST", endpoint, json=query)
+                batch_issues = response.get("issues", [])
 
-    def create_client(self, service_name: str) -> boto3.client:
-        return self.session.client(service_name)
+                if not batch_issues:
+                    break
 
-    def create_resource(self, service_name: str) -> boto3.resource:
-        return self.session.resource(service_name)
+                issues.extend(batch_issues)
+                start_at += batch_size
 
-    def get_credentials(self) -> Dict[str, str]:
-        return {
-            'aws_access_key_id': self.credentials['access_key_id'],
-            'aws_secret_access_key': self.credentials['secret_access_key'],
-            'aws_session_token': self.credentials['session_token'],
-            'region': self.credentials['region']
+                if len(batch_issues) < batch_size:
+                    break
+
+            return issues
+
+        except Exception as e:
+            logger.error(f"Error listing issues: {str(e)}")
+            return []
+
+    def get_issue_data(self, issue_id: str) -> Dict[str, Any]:
+        """Get detailed information about a specific issue."""
+        endpoint = f"/rest/api/{self._api_version}/issue/{issue_id}"
+        params = {
+            "expand": "renderedFields,names,schema,transitions,operations,editmeta,changelog"
         }
+        return self._request("GET", endpoint, params=params)
 
 
-class S3Client(BaseAWSClient):
+# Example usage:
+if __name__ == "__main__":
+    config = {
+        "domain": "your-domain.atlassian.net",
+        "email": "your-email@example.com",
+        "api_token": "your-api-token"
+    }
 
-    def __init__(self, config: Dict[str, Any] = None):
-        """Initialize S3 client with bucket name from settings.
-        Args:
-            config: Kept for backwards compatibility, not used. All config comes from settings.
-        """
-        super().__init__(config)
-        self.bucket_name = settings.AWS_BUCKET_NAME
+    client = JiraClient()
 
-        self.s3_client = self.create_client('s3')
-        self.s3_resource = self.create_resource('s3')
-        self.bucket = self.s3_resource.Bucket(self.bucket_name)
+    # List issues
+    issues = client.list_issues()
+    print(f"Found {len(issues)} issues")
 
-    def download_file(self, file_key: str, filename: str) -> str:
-        try:
-            self.bucket.download_file(file_key, filename)
-            return filename
-        except ClientError as e:
-            raise ValueError(f"Error downloading file: {str(e)}")
-
-    def list_files(self, prefix: str = "") -> List[Dict[str, Any]]:
-        items = []
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-
-        try:
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                if 'Contents' in page:
-                    items.extend(page['Contents'])
-        except ClientError as e:
-            raise ValueError(f"Error listing files: {str(e)}")
-
-        return items
-
-    def get_file_metadata(self, file_key: str) -> Dict[str, Any]:
-        try:
-            response = self.s3_client.head_object(Bucket=self.bucket_name, Key=file_key)
-            return {
-                'ContentLength': response.get('ContentLength', 0),
-                'LastModified': response.get('LastModified'),
-                'ContentType': response.get('ContentType'),
-                'Metadata': response.get('Metadata', {})
-            }
-        except ClientError as e:
-            raise ValueError(f"Error getting file metadata: {str(e)}")
+    # Get specific issue
+    if issues:
+        issue_key = issues[0]["key"]
+        issue_data = client.get_issue_data(issue_key)
+        print(f"Retrieved data for issue {issue_key}")

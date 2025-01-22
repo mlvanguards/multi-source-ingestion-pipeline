@@ -17,6 +17,7 @@ class Pipeline:
         result = None
         for step in self.steps:
             result = step(result)
+        return result
 
     def add_step(self, step: PipelineStep):
         self.steps.append(step)

@@ -1,64 +1,115 @@
-import os
-from typing import Dict, Any, Optional, List
+import logging
+
+from typing import Any, Optional, List, Dict
 
 from src.base import BaseReader
-from src.gateways import S3Client
+from src.gateways import JiraClient
+
+logger = logging.getLogger(__name__)
 
 
-class S3BucketReader(BaseReader):
-    """S3 Bucket Reader. Reads files from an S3 bucket."""
+class JiraReader(BaseReader):
+    """Jira reader. Reads issues and their related data."""
 
-    def __init__(
-            self,
-            client_config: Dict[str, Any] = None
-    ):
-        """Initialize S3 bucket reader.
-        Args:
-            client_config: Kept for backwards compatibility. Only user and token are used from this.
-        """
-        self.user = client_config.get("user")
-        self.prefix = client_config.get("prefix")
+    def __init__(self):
+        self.client = JiraClient()
 
-        self.client = S3Client()
-
-    def _build_path(self, key: str) -> str:
-        return key
-
-    def download_file(self, file_key: str, filepath: str) -> str:
+    def _get_epic_data(self, epic_key: str) -> Optional[Dict[str, Any]]:
         try:
-            return self.client.download_file(file_key, filepath)
+            return self.client.get_issue_data(epic_key)
         except Exception as e:
-            print(f"Error downloading file {file_key}: {e}")
+            logger.warning(f"Failed to fetch epic data for {epic_key}: {str(e)}")
+            return None
 
-    def load_items(self) -> Optional[List[Any]]:
-        files = self.client.list_files(prefix=self.prefix)
+    def _build_issue_path(self, issue_data: Dict[str, Any]) -> str:
+        print("Building issue path")
+        fields = issue_data["fields"]
+        project_key = fields["project"]["key"]
 
-        items = []
+        epic_key = fields.get("customfield_10014")
+        if not epic_key:
+            epic_key = fields.get("parent", {}).get("key") if fields.get("parent") else None
 
-        print(f"Successfully collected: {len(files)} files from S3 for {self.user.id}")
+        epic_name = None
+        if epic_key:
+            epic_data = self._get_epic_data(epic_key)
+            if epic_data:
+                epic_name = epic_data["fields"]["summary"]
+            else:
+                epic_name = epic_key
+        return f"{project_key}/{epic_name}/{issue_data['key']}"
 
-        for f in files:
-            if not f['Key'].endswith('/'):
-                items.append({
-                    "name": os.path.basename(f['Key']),
-                    "provider_id": f['Key'],
-                    "mimeType": self._get_mimetype(f['Key']),
-                    "created_time": f['LastModified'].isoformat(),
-                    "modified_time": f['LastModified'].isoformat(),
-                    "size": f['Size'],
-                    "path": self._build_path(f['Key']),
-                    "provider": "aws_s3",
-                    "parents": [{
-                        "id": os.path.dirname(f['Key']),
-                        "name": os.path.dirname(f['Key'])
-                    }],
-                    "owners": [self.user.id],
-                    "shared": [self.user.id],
-                })
+    def _extract_sprint_info(self, sprints: List[Dict[str, Any]]) -> str:
+        print("Extracting sprint info")
+        if not sprints:
+            return ""
 
-        return items
+        active_sprint = next((sprint for sprint in sprints if sprint.get("state") == "active"), None)
+        return active_sprint["name"] if active_sprint else sprints[0]["name"]
 
-    def _get_mimetype(self, key: str) -> str:
-        import mimetypes
-        mime_type, _ = mimetypes.guess_type(key)
-        return mime_type or 'application/octet-stream'
+    def _get_issue_data(self, issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        print("Obtaining issue data")
+        try:
+            data = self.client.get_issue_data(issue["id"])
+            fields = data["fields"]
+
+            if not fields.get("summary"):
+                return None
+
+            path = self._build_issue_path(data)
+
+            description_raw = fields.get("description", "")
+            description_rendered = data.get("renderedFields", {}).get("description", "")
+
+            return {
+                "id": data["id"],
+                "key": data["key"],
+                "title": fields["summary"],
+                "description": description_raw,
+                "description_html": description_rendered,
+                "type": fields["issuetype"]["name"],
+                "project_id": fields["project"]["id"],
+                "project_name": fields["project"]["name"],
+                "project_key": fields["project"]["key"],
+                "path": str(path),
+                "watches": str(fields["watches"]["watchCount"]),
+                "sprint": self._extract_sprint_info(fields.get("customfield_10020", [])),
+                "priority": fields["priority"]["name"] if fields.get("priority") else "",
+                "status": fields["status"]["name"],
+                "labels": fields.get("labels", []),
+                "assignees": [fields["assignee"]["displayName"]] if fields.get("assignee") else [],
+                "creator": fields["creator"]["displayName"],
+                "reporter": fields["reporter"]["displayName"],
+                "subtasks": [subtask["key"] for subtask in fields.get("subtasks", [])],
+                "provider": "jira",
+                "user_id": "test_id",
+                "provider_id": data["id"],
+                "created_at": fields["created"],
+                "updated_at": fields["updated"]
+            }
+        except Exception as e:
+            logger.error(f"Error processing issue {issue.get('id')}: {str(e)}")
+            return None
+
+    def load_items(self) -> Optional[List[Dict[str, Any]]]:
+        processed_issues = []
+
+        try:
+            print("Listing Issues")
+            issues = self.client.list_issues()
+            print(f"Issues extracted: {len(issues)}")
+
+            for issue in issues:
+                print(f"Extracting Issue Data")
+                data = self._get_issue_data(issue)
+                print(f"Extracted data: {data}")
+                if not data:
+                    continue
+                processed_issues.append(data)
+
+            logger.info(f"Successfully collected {len(processed_issues)} issues from Jira")
+            return processed_issues
+
+        except Exception as e:
+            logger.error(f"Failed to load Jira issues: {str(e)}")
+            return None
